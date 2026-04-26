@@ -1,0 +1,97 @@
+#!/bin/bash
+#PBS -N amber_1ZQ5
+#PBS -J 1-3
+#PBS -l select=1:ncpus=1:mem=8gb:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+# ---- Environment setup ----
+source /app1/ebenv
+module load Amber/22.5-foss-2022a-AmberTools-23.5-CUDA-11.7.0
+
+# ---- Move to parent directory ----
+cd $PBS_O_WORKDIR
+
+# ---- Array Job Assignment ----
+# Read the N-th line from systems.txt
+LIG=$(sed -n "${PBS_ARRAY_INDEX}p" systems.txt)
+TARGET_DIR="1ZQ5_${LIG}"
+
+echo "Starting Array Job ${PBS_ARRAY_INDEX} for Ligand: ${LIG}"
+
+# Move into the specific system's folder
+cd ${TARGET_DIR} || { echo "Failed to enter directory ${TARGET_DIR}"; exit 1; }
+
+PMEMD="pmemd.cuda"
+PRMTOP="complex_${LIG}_wat.prmtop"
+INPCRD="complex_${LIG}_wat.rst7"
+PREFIX="${LIG}"
+
+# ---- Step 1: Restrained Minimization ----
+echo "[${LIG}] Starting restrained minimization..."
+$PMEMD -O \
+  -i min1.in \
+  -o ${PREFIX}_min1.out \
+  -p $PRMTOP \
+  -c $INPCRD \
+  -r ${PREFIX}_min1.ncrst \
+  -ref $INPCRD
+if [ $? -ne 0 ]; then echo "Min 1 failed"; exit 1; fi
+
+# ---- Step 2: Unrestrained Minimization ----
+echo "[${LIG}] Starting unrestrained minimization..."
+$PMEMD -O \
+  -i min2.in \
+  -o ${PREFIX}_min2.out \
+  -p $PRMTOP \
+  -c ${PREFIX}_min1.ncrst \
+  -r ${PREFIX}_min2.ncrst
+if [ $? -ne 0 ]; then echo "Min 2 failed"; exit 1; fi
+
+# ---- Step 3: Heating ----
+echo "[${LIG}] Starting heating..."
+$PMEMD -O \
+  -i md_heat.in \
+  -o ${PREFIX}_md_heat.out \
+  -p $PRMTOP \
+  -c ${PREFIX}_min2.ncrst \
+  -r ${PREFIX}_md_heat.ncrst \
+  -x ${PREFIX}_md_heat.nc \
+  -ref ${PREFIX}_min2.ncrst
+if [ $? -ne 0 ]; then echo "Heating failed"; exit 1; fi
+
+# ---- Step 4: Equilibration ----
+echo "[${LIG}] Starting equilibration..."
+$PMEMD -O \
+  -i md_equil.in \
+  -o ${PREFIX}_md_equil.out \
+  -p $PRMTOP \
+  -c ${PREFIX}_md_heat.ncrst \
+  -r ${PREFIX}_md_equil.ncrst \
+  -x ${PREFIX}_md_equil.nc
+if [ $? -ne 0 ]; then echo "Equilibration failed"; exit 1; fi
+
+# ---- Step 5: Production (100 ns total: 2 chunks of 50ns) ----
+PREV_RST=${PREFIX}_md_equil.ncrst
+
+for i in $(seq 1 2); do
+  PADDED=$(printf "%03d" $i)
+  echo "[${LIG}] Starting production chunk ${PADDED}..."
+
+  $PMEMD -O \
+    -i md_prod.in \
+    -o ${PREFIX}_prod_${PADDED}.out \
+    -p $PRMTOP \
+    -c ${PREV_RST} \
+    -r ${PREFIX}_prod_${PADDED}.ncrst \
+    -x ${PREFIX}_prod_${PADDED}.nc
+
+  if [ $? -ne 0 ]; then
+    echo "Production chunk ${PADDED} failed"
+    exit 1
+  fi
+
+  PREV_RST=${PREFIX}_prod_${PADDED}.ncrst
+done
+
+echo "[${LIG}] All done! 100 ns total production collected."
